@@ -181,6 +181,19 @@ export function peelToCommit(oid: string): string | null {
   return null;
 }
 
+/** Parsed-commit cache: objects are immutable, so a commit's view never changes. */
+const commitViews = new Map<string, CommitView>();
+
+export function commitView(oid: string): CommitView | null {
+  const hit = commitViews.get(oid);
+  if (hit) return hit;
+  const obj = objects.get(oid);
+  if (!obj || obj.type !== 'commit') return null;
+  const view = parseCommit(obj.data);
+  commitViews.set(oid, view);
+  return view;
+}
+
 /** Every commit reachable from `tip` (full history walk), including `tip`. */
 export function commitAncestors(tip: string): Set<string> {
   const seen = new Set<string>();
@@ -192,14 +205,29 @@ export function commitAncestors(tip: string): Set<string> {
     if (!commit) continue;
     if (seen.has(commit)) continue;
     seen.add(commit);
-    const obj = objects.get(commit);
-    if (obj) for (const parent of parseCommit(obj.data).parents) stack.push(parent);
+    const view = commitView(commit);
+    if (view) for (const parent of view.parents) stack.push(parent);
   }
   return seen;
 }
 
 export function isAncestor(ancestor: string, tip: string): boolean {
-  return commitAncestors(tip).has(ancestor);
+  // Early-exit walk: a fast-forward check only needs to know whether `ancestor`
+  // shows up on the way back from `tip`, not the whole ancestry. A push that
+  // extends a branch finds its old tip one step down.
+  const seen = new Set<string>();
+  const stack = [tip];
+  while (stack.length) {
+    const oid = stack.pop() as string;
+    if (seen.has(oid)) continue;
+    seen.add(oid);
+    const commit = peelToCommit(oid);
+    if (!commit) continue;
+    if (commit === ancestor) return true;
+    const view = commitView(commit);
+    if (view) for (const parent of view.parents) stack.push(parent);
+  }
+  return false;
 }
 
 /** The best common ancestor of two commits (the one with the smallest combined distance). */
@@ -214,8 +242,8 @@ export function mergeBase(a: string, b: string): string | null {
         const commit = peelToCommit(oid);
         if (!commit || dist.has(commit)) continue;
         dist.set(commit, depth);
-        const obj = objects.get(commit);
-        if (obj) next.push(...parseCommit(obj.data).parents);
+        const view = commitView(commit);
+        if (view) next.push(...view.parents);
       }
       frontier = next;
       depth += 1;
@@ -519,7 +547,7 @@ export function planFetch(
     if (!obj) continue;
     if (isCommit && obj.type === 'commit') {
       excludedCommits.add(oid);
-      const view = parseCommit(obj.data);
+      const view = commitView(oid) as CommitView;
       excludeStack.push({ oid: view.tree, isCommit: false });
       if (!shallowSet.has(oid)) {
         for (const parent of view.parents) excludeStack.push({ oid: parent, isCommit: true });
@@ -564,11 +592,11 @@ export function planFetch(
     const next: string[] = [];
     for (const commit of frontier) {
       const generation = generations.get(commit) as number;
-      const obj = objects.get(commit);
-      if (!obj) continue;
-      const view = parseCommit(obj.data);
+      const view = commitView(commit);
+      if (!view) continue;
       const beyondDepth = depth !== null && generation >= depth;
-      const beyondSince = deepenSince !== null && commitTime(obj.data) <= deepenSince;
+      const timeMatch = / (\d+) [+-]\d{4}$/.exec(view.authorLine);
+      const beyondSince = deepenSince !== null && (timeMatch ? Number(timeMatch[1]) : 0) <= deepenSince;
       const cut = beyondDepth || beyondSince || notCommits.has(commit);
       if (view.parents.length && cut) boundary.add(commit);
       if (!excludedCommits.has(commit)) {

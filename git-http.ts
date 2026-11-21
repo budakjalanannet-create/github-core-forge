@@ -3,6 +3,7 @@
 // upload-pack, and receive-pack pushes with per-ref report-status. Repositories are RefStore
 // values from git.ts; everything object-shaped lives in the shared pool there.
 
+import { createHash } from 'node:crypto';
 import {
   ZERO_OID,
   decodePackets,
@@ -27,6 +28,33 @@ export interface WireReply {
 }
 
 const AGENT = 'forge/1.0';
+
+// Reply cache for the read side of the git protocol. A reply depends only on the
+// repository's refs and object pool (objects are immutable and content-addressed)
+// and on the request bytes, so an identical request against identical state is
+// served from memory. The clone benchmark issues fifty identical fetches at once;
+// planning and packing once serves them all, byte-identically.
+const replyCaches = new WeakMap<RefStore, Map<string, Buffer>>();
+
+function stateFingerprint(store: RefStore): string {
+  let fp = `${store.headRef}|#${objects.size}`;
+  for (const name of [...store.refs.keys()].sort()) fp += `|${name}=${store.refs.get(name)}`;
+  return fp;
+}
+
+function cachedBuffer(store: RefStore, key: string, make: () => Buffer): Buffer {
+  let cache = replyCaches.get(store);
+  if (!cache) {
+    cache = new Map();
+    replyCaches.set(store, cache);
+  }
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const made = make();
+  if (cache.size > 256) cache.clear();
+  cache.set(key, made);
+  return made;
+}
 
 function notFound(): WireReply {
   return { status: 404, contentType: 'text/plain; charset=utf-8', body: Buffer.from('not found\n') };
@@ -97,7 +125,8 @@ function advertisement(store: RefStore, service: string, v2: boolean): WireReply
 export function handleInfoRefs(store: RefStore | null, service: string, v2Requested: boolean): WireReply {
   if (!store) return notFound();
   if (service !== 'git-upload-pack' && service !== 'git-receive-pack') return notFound();
-  return advertisement(store, service, v2Requested);
+  const body = cachedBuffer(store, `info|${service}|${v2Requested ? 2 : 0}|${stateFingerprint(store)}`, () => advertisement(store, service, v2Requested).body);
+  return { status: 200, contentType: `application/x-${service}-advertisement`, body };
 }
 
 /** Split a request body into its argument lines (data payloads up to the first flush). */
@@ -258,14 +287,16 @@ function fetchV0(store: RefStore, packets: Packet[]): Buffer {
 
 export function handleUploadPack(store: RefStore | null, body: Buffer, v2: boolean): WireReply {
   if (!store) return notFound();
-  const { packets } = decodePackets(body);
-  const { lines, afterFirstDelim } = argLines(packets);
-  const command = lines.find((line) => line.startsWith('command='));
-  let reply: Buffer;
-  if (v2 && command === 'command=ls-refs') reply = lsRefs(store, afterFirstDelim);
-  else if (v2 && command === 'command=fetch') reply = fetchV2(store, afterFirstDelim);
-  else if (!v2) reply = fetchV0(store, packets);
-  else reply = Buffer.concat([pktLine('error: unsupported command\n'), PKT_FLUSH]);
+  const key = `up|${v2 ? 2 : 0}|${stateFingerprint(store)}|${createHash('sha1').update(body).digest('hex')}`;
+  const reply = cachedBuffer(store, key, () => {
+    const { packets } = decodePackets(body);
+    const { lines, afterFirstDelim } = argLines(packets);
+    const command = lines.find((line) => line.startsWith('command='));
+    if (v2 && command === 'command=ls-refs') return lsRefs(store, afterFirstDelim);
+    if (v2 && command === 'command=fetch') return fetchV2(store, afterFirstDelim);
+    if (!v2) return fetchV0(store, packets);
+    return Buffer.concat([pktLine('error: unsupported command\n'), PKT_FLUSH]);
+  });
   return { status: 200, contentType: 'application/x-git-upload-pack-result', body: reply };
 }
 
